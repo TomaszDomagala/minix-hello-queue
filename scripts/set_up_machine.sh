@@ -25,7 +25,7 @@ done
 echo "setting up ssh key"
 ssh-copy-id root@localhost -p "${ssh_port}" || fail "could not copy ssh key"
 
-echo "installing rsync"
-ssh root@localhost -p "${ssh_port}" "pkgin -y in rsync"
+# echo "installing rsync"
+# ssh root@localhost -p "${ssh_port}" "pkgin -y in rsync"
 
 echo "setup done"

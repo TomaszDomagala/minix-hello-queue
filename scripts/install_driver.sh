@@ -21,12 +21,27 @@ then
 fi
 done
 
-cd "${dir}/.." || fail "could not cd to / dir"
-file="${username}.patch"
+# cd "${dir}/.." || fail "could not cd to / dir"
+file="driver.conf"
 
 if [[ ! -f "$file" ]]; then
     fail "could not find $file. use craete_patch.sh to generate .patch file"
 fi
 
 scp -P "${ssh_port}" "./$file" "root@localhost:/" || fail "could not copy file to the machine"
-ssh -p "${ssh_port}" root@localhost "cd /; patch -p1 < $file" || fail "could not apply changes"
+ssh -p "${ssh_port}" root@localhost << EOF
+cd / || exit 1
+cat driver.conf >> /etc/system.conf	|| exit 1
+
+cd /usr/src/minix/drivers/hello_queue	|| exit 1
+make clean 	|| exit 1
+make		|| exit 1
+make install	|| exit 1
+
+mknod /dev/hello_queue c 17 0 || exit 1
+
+service up /service/hello_queue -dev /dev/hello_queue || exit 1
+
+echo "Done"
+
+EOF
