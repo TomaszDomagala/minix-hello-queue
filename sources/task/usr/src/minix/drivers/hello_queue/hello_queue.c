@@ -5,6 +5,7 @@
 #include <minix/ds.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/ioc_hello_queue.h>
 
 #define HELLO_MESSAGE "Hello, World!\n"
 
@@ -20,6 +21,10 @@ static ssize_t hq_write(devminor_t UNUSED(minor), u64_t position,
                         endpoint_t endpt, cp_grant_id_t grant, size_t size,
                         int UNUSED(flags), cdev_id_t UNUSED(id));
 
+static int hq_ioctl(devminor_t minor, unsigned long request, endpoint_t endpt,
+                    cp_grant_id_t grant, int flags, endpoint_t user_endpt,
+                    cdev_id_t id);
+
 // Fills buffer with repeating "xyz" string.
 static void fill_buffer();
 
@@ -28,6 +33,14 @@ static void buffer_down(u64_t size);
 
 // Make space for size bytes in the buffer.
 static int buffer_up(u64_t size);
+
+static int do_res();
+
+static int do_set(endpoint_t endpt, cp_grant_id_t gid);
+
+static int do_cxch(endpoint_t endpt, cp_grant_id_t gid);
+
+static int do_del();
 
 /* SEF functions and variables. */
 static void sef_local_startup(void);
@@ -40,7 +53,8 @@ static struct chardriver hello_tab = {
     .cdr_open = hq_open,
     .cdr_close = hq_close,
     .cdr_read = hq_read,
-	.cdr_write = hq_write,
+    .cdr_write = hq_write,
+    .cdr_ioctl = hq_ioctl,
 };
 
 // TODO remove this.
@@ -85,7 +99,7 @@ static ssize_t hq_write(devminor_t UNUSED(minor), u64_t position,
                         endpoint_t endpt, cp_grant_id_t grant, size_t size,
                         int UNUSED(flags), cdev_id_t UNUSED(id)) {
     int ret;
-	char *ptr = hq_buffer + hq_head + hq_size;
+    char *ptr = hq_buffer + hq_head + hq_size;
 
     if ((ret = buffer_up(size)) != OK) {
         return ret;
@@ -94,9 +108,91 @@ static ssize_t hq_write(devminor_t UNUSED(minor), u64_t position,
     if ((ret = sys_safecopyfrom(endpt, grant, 0, (vir_bytes)ptr, size)) != OK) {
         return ret;
     }
-	hq_size += size;
+    hq_size += size;
 
     return size;
+}
+
+static int hq_ioctl(devminor_t minor, unsigned long request, endpoint_t endpt,
+                    cp_grant_id_t grant, int flags, endpoint_t user_endpt,
+                    cdev_id_t id) {
+    switch (request) {
+        case HQIOCRES:
+            return do_res();
+        case HQIOCSET:
+            return do_set(endpt, grant);
+        case HQIOCXCH:
+            return do_cxch(endpt, grant);
+        case HQIOCDEL:
+            return do_del();
+    }
+
+    return ENOTTY;
+}
+
+static int do_res() {
+    char *ptr = realloc(hq_buffer, DEVICE_SIZE);
+    if (ptr == NULL) return ENOMEM;
+
+    hq_capacity = DEVICE_SIZE;
+    hq_size = DEVICE_SIZE;
+    hq_head = 0;
+    fill_buffer();
+    return OK;
+}
+
+static int do_set(endpoint_t endpt, cp_grant_id_t gid) {
+    char msg[MSG_SIZE];
+    int ret;
+
+    if ((ret = sys_safecopyfrom(endpt, gid, 0, msg, MSG_SIZE)) != OK) {
+        return ret;
+    }
+
+    if (hq_size < MSG_SIZE) {
+        if ((ret = buffer_up(MSG_SIZE - hq_size)) != OK) {
+            return ret;
+        }
+        hq_size = MSG_SIZE;
+    }
+    memcpy(hq_buffer + hq_head + hq_size - MSG_SIZE, msg, MSG_SIZE);
+
+    return OK;
+}
+
+static int do_cxch(endpoint_t endpt, cp_grant_id_t gid) {
+    char msg[2];
+    int ret;
+
+    if ((ret = sys_safecopyfrom(endpt, gid, 0, msg, 2)) != OK) {
+        return ret;
+    }
+
+    size_t i = hq_head, end = hq_head + hq_size;
+    for (; i < end; i++) {
+        if (hq_buffer[i] == msg[0]) {
+            hq_buffer[i] = msg[1];
+        }
+    }
+
+    return OK;
+}
+
+static int do_del() {
+    int shift = 0;
+    size_t i = hq_head, j = 1, end = hq_head + hq_size;
+
+    for (; i < end; i++) {
+        if (j == 3) {
+            j = 1;
+            shift++;
+            continue;
+        }
+        hq_buffer[i - shift] = hq_buffer[i];
+        j++;
+    }
+    hq_size -= shift;
+    return OK;
 }
 
 static int sef_cb_lu_state_save(int UNUSED(state)) {
@@ -226,7 +322,7 @@ static int buffer_up(u64_t size) {
         }
         char *ptr = realloc(hq_buffer, new_capacity);
         if (ptr == NULL) return ENOMEM;
-		hq_buffer = ptr;
+        hq_buffer = ptr;
         hq_capacity = new_capacity;
     }
 
