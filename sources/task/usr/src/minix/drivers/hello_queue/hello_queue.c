@@ -3,6 +3,7 @@
 #include <minix/chardriver.h>
 #include <minix/drivers.h>
 #include <minix/ds.h>
+#include <minix/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioc_hello_queue.h>
@@ -38,7 +39,7 @@ static int do_res();
 
 static int do_set(endpoint_t endpt, cp_grant_id_t gid);
 
-static int do_cxch(endpoint_t endpt, cp_grant_id_t gid);
+static int do_xch(endpoint_t endpt, cp_grant_id_t gid);
 
 static int do_del();
 
@@ -57,9 +58,6 @@ static struct chardriver hello_tab = {
     .cdr_ioctl = hq_ioctl,
 };
 
-// TODO remove this.
-static int open_counter;
-
 // Query buffer.
 char *hq_buffer;
 
@@ -77,13 +75,16 @@ static int hq_close(devminor_t UNUSED(minor)) { return OK; }
 static ssize_t hq_read(devminor_t UNUSED(minor), u64_t UNUSED(position),
                        endpoint_t endpt, cp_grant_id_t grant, size_t size,
                        int UNUSED(flags), cdev_id_t UNUSED(id)) {
-    u64_t dev_size;
     char *ptr = hq_buffer + hq_head;
     int ret;
 
+    if (size == 0) return 0;
+
     if (hq_size == 0) return 0; /* EOF */
 
-    if (size > hq_size) size = hq_size;
+    if (size > hq_size) {
+        size = hq_size;
+    }
 
     /* Copy the requested part to the caller. */
     if ((ret = sys_safecopyto(endpt, grant, 0, (vir_bytes)ptr, size)) != OK)
@@ -98,18 +99,21 @@ static ssize_t hq_read(devminor_t UNUSED(minor), u64_t UNUSED(position),
 static ssize_t hq_write(devminor_t UNUSED(minor), u64_t position,
                         endpoint_t endpt, cp_grant_id_t grant, size_t size,
                         int UNUSED(flags), cdev_id_t UNUSED(id)) {
+    char *ptr;
     int ret;
-    char *ptr = hq_buffer + hq_head + hq_size;
+
+    if (size == 0) return 0;
 
     if ((ret = buffer_up(size)) != OK) {
         return ret;
     }
+    ptr = hq_buffer + hq_head + hq_size;
 
     if ((ret = sys_safecopyfrom(endpt, grant, 0, (vir_bytes)ptr, size)) != OK) {
         return ret;
     }
-    hq_size += size;
 
+    hq_size += size;
     return size;
 }
 
@@ -122,7 +126,7 @@ static int hq_ioctl(devminor_t minor, unsigned long request, endpoint_t endpt,
         case HQIOCSET:
             return do_set(endpt, grant);
         case HQIOCXCH:
-            return do_cxch(endpt, grant);
+            return do_xch(endpt, grant);
         case HQIOCDEL:
             return do_del();
     }
@@ -134,10 +138,12 @@ static int do_res() {
     char *ptr = realloc(hq_buffer, DEVICE_SIZE);
     if (ptr == NULL) return ENOMEM;
 
+    hq_buffer = ptr;
     hq_capacity = DEVICE_SIZE;
     hq_size = DEVICE_SIZE;
     hq_head = 0;
     fill_buffer();
+
     return OK;
 }
 
@@ -145,7 +151,8 @@ static int do_set(endpoint_t endpt, cp_grant_id_t gid) {
     char msg[MSG_SIZE];
     int ret;
 
-    if ((ret = sys_safecopyfrom(endpt, gid, 0, msg, MSG_SIZE)) != OK) {
+    if ((ret = sys_safecopyfrom(endpt, gid, 0, (vir_bytes)msg, MSG_SIZE)) !=
+        OK) {
         return ret;
     }
 
@@ -160,11 +167,11 @@ static int do_set(endpoint_t endpt, cp_grant_id_t gid) {
     return OK;
 }
 
-static int do_cxch(endpoint_t endpt, cp_grant_id_t gid) {
+static int do_xch(endpoint_t endpt, cp_grant_id_t gid) {
     char msg[2];
     int ret;
 
-    if ((ret = sys_safecopyfrom(endpt, gid, 0, msg, 2)) != OK) {
+    if ((ret = sys_safecopyfrom(endpt, gid, 0, (vir_bytes)msg, 2)) != OK) {
         return ret;
     }
 
@@ -197,18 +204,28 @@ static int do_del() {
 
 static int sef_cb_lu_state_save(int UNUSED(state)) {
     /* Save the state. */
-    ds_publish_u32("open_counter", open_counter, DSF_OVERWRITE);
-
+    u32_t size = hq_size;
+    ds_publish_u32("hq_size", size, DSF_OVERWRITE);
+    ds_publish_mem("hq_mem", hq_buffer + hq_head, hq_size, DSF_OVERWRITE);
     return OK;
 }
 
 static int lu_state_restore() {
     /* Restore the state. */
-    u32_t value;
+    u32_t size;
+    size_t length;
 
-    ds_retrieve_u32("open_counter", &value);
-    ds_delete_u32("open_counter");
-    open_counter = (int)value;
+    ds_retrieve_u32("hq_size", &size);
+    ds_delete_u32("hq_size");
+
+    hq_size = size;
+    hq_capacity = 2 * hq_size;
+    hq_head = 0;
+    hq_buffer = malloc(hq_capacity);
+
+    length = hq_size;
+    ds_retrieve_mem("hq_mem", hq_buffer, &length);
+    ds_delete_mem("hq_mem");
 
     return OK;
 }
@@ -240,7 +257,6 @@ static int sef_cb_init(int type, sef_init_info_t *UNUSED(info)) {
     /* Initialize the hello driver. */
     int do_announce_driver = TRUE;
 
-    open_counter = 0;
     switch (type) {
         case SEF_INIT_FRESH:
             hq_buffer = malloc(DEVICE_SIZE);
@@ -250,19 +266,16 @@ static int sef_cb_init(int type, sef_init_info_t *UNUSED(info)) {
             hq_head = 0;
 
             fill_buffer();
-            printf("%s", HELLO_MESSAGE);
             break;
 
         case SEF_INIT_LU:
             /* Restore the state. */
             lu_state_restore();
             do_announce_driver = FALSE;
-
-            printf("%sHey, I'm a new version!\n", HELLO_MESSAGE);
             break;
 
         case SEF_INIT_RESTART:
-            printf("%sHey, I've just been restarted!\n", HELLO_MESSAGE);
+            lu_state_restore();
             break;
     }
 
@@ -276,7 +289,7 @@ static int sef_cb_init(int type, sef_init_info_t *UNUSED(info)) {
 }
 
 static void fill_buffer() {
-    char *pattern = "xyz";
+    static char *pattern = "xyz";
 
     u64_t i = 0, j = 0;
     for (; i < hq_capacity; i++, j++) {
@@ -292,7 +305,7 @@ static void buffer_down(u64_t size) {
     hq_size -= size;
 
     if (hq_size < hq_capacity / 4) {
-        if (hq_size > 0) {
+        if (hq_size > 0 && hq_head != 0) {
             memmove(hq_buffer, hq_buffer + hq_head, hq_size);
         }
         hq_head = 0;
@@ -310,7 +323,7 @@ static void buffer_down(u64_t size) {
 }
 
 static int buffer_up(u64_t size) {
-    if (hq_head + hq_size + size > hq_capacity && hq_head != 0) {
+    if (hq_head != 0 && (hq_head + hq_size + size > hq_capacity)) {
         memmove(hq_buffer, hq_buffer + hq_head, hq_size);
         hq_head = 0;
     }
@@ -324,6 +337,7 @@ static int buffer_up(u64_t size) {
         if (ptr == NULL) return ENOMEM;
         hq_buffer = ptr;
         hq_capacity = new_capacity;
+        hq_head = 0;
     }
 
     return OK;
@@ -339,5 +353,6 @@ int main(void) {
      * Run the main loop.
      */
     chardriver_task(&hello_tab);
+    free(hq_buffer);
     return OK;
 }

@@ -40,7 +40,7 @@ make install	|| exit 1
 
 mknod /dev/hello_queue c 17 0 || exit 1
 
-service up /service/hello_queue -dev /dev/hello_queue || exit 1
+# service up /service/hello_queue -dev /dev/hello_queue || exit 1
 
 echo "Done"
 
